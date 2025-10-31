@@ -130,17 +130,14 @@ select_instance_type() {
 }
 
 prompt_encrypted_volume() {
-	read -p "암호화된 EBS 볼륨을 사용하시겠습니까? (y/N): " yn
-	yn=${yn:-N}
-	[[ "$yn" =~ ^[Yy]$ ]] || {
-		USE_ENC_VOL=0
-		return
-	}
-	USE_ENC_VOL=1
-	echo "용량: 1)32 2)64 3)128 4)256 (GB)"
-	read -p "선택 [2]: " s
-	s=${s:-2}
-	case "$s" in 1) VOL_SIZE_GB=32 ;; 2) VOL_SIZE_GB=64 ;; 3) VOL_SIZE_GB=128 ;; 4) VOL_SIZE_GB=256 ;; *) VOL_SIZE_GB=64 ;; esac
+    read -p "암호화된 EBS 볼륨을 사용하시겠습니까? (y/N): " yn
+    yn=${yn:-N}
+    [[ "$yn" =~ ^[Yy]$ ]] || {
+        USE_ENC_VOL=0
+        return
+    }
+    # Only enable usage here; size will be asked later only if a new volume is created
+    USE_ENC_VOL=1
 }
 
 derive_volume_from_key() {
@@ -276,11 +273,11 @@ create_security_group() {
 generate_vnc_password() { echo "$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)"; }
 
 attach_and_mount_volume() {
-	[ "$USE_ENC_VOL" -eq 1 ] || return 0
-	INSTANCE_AZ=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
-	if [ -z "${VOLUME_ID:-}" ] || [ "$VOLUME_ID" = "None" ]; then
-		VOLUME_ID=$(aws ec2 describe-volumes --region "$AWS_REGION" --filters Name=tag:Name,Values="$VOL_NAME" Name=status,Values=available,in-use --query 'Volumes[0].VolumeId' --output text 2>/dev/null || echo None)
-	fi
+    [ "$USE_ENC_VOL" -eq 1 ] || return 0
+    INSTANCE_AZ=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
+    if [ -z "${VOLUME_ID:-}" ] || [ "$VOLUME_ID" = "None" ]; then
+        VOLUME_ID=$(aws ec2 describe-volumes --region "$AWS_REGION" --filters Name=tag:Name,Values="$VOL_NAME" Name=status,Values=available,in-use --query 'Volumes[0].VolumeId' --output text 2>/dev/null || echo None)
+    fi
 	if [ -n "$VOLUME_ID" ] && [ "$VOLUME_ID" != "None" ]; then
 		VOLUME_AZ=$(aws ec2 describe-volumes --region "$AWS_REGION" --volume-ids "$VOLUME_ID" --query 'Volumes[0].AvailabilityZone' --output text)
 		ATTACHED_TO=$(aws ec2 describe-volumes --region "$AWS_REGION" --volume-ids "$VOLUME_ID" --query 'Volumes[0].Attachments[0].InstanceId' --output text 2>/dev/null || echo None)
@@ -300,15 +297,20 @@ attach_and_mount_volume() {
 			aws ec2 wait volume-available --volume-ids "$VOLUME_ID" --region "$AWS_REGION" 2>/dev/null || true
 		fi
 	fi
-	if [ -z "${VOLUME_ID:-}" ] || [ "$VOLUME_ID" = "None" ]; then
-		read -p "볼륨이 없습니다. 생성할까요? (y/N): " yn
-		yn=${yn:-N}
-		[[ "$yn" =~ ^[Yy]$ ]] || return 0
-		VOLUME_ID=$(aws ec2 create-volume --size "$VOL_SIZE_GB" --availability-zone "$INSTANCE_AZ" --volume-type gp3 --encrypted \
-			--tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=$VOL_NAME},{Key=Purpose,Value=temp-terminal-enc}]" \
-			--region "$AWS_REGION" --query 'VolumeId' --output text)
-		aws ec2 wait volume-available --volume-ids "$VOLUME_ID" --region "$AWS_REGION"
-	fi
+    if [ -z "${VOLUME_ID:-}" ] || [ "$VOLUME_ID" = "None" ]; then
+        read -p "볼륨이 없습니다. 생성할까요? (y/N): " yn
+        yn=${yn:-N}
+        [[ "$yn" =~ ^[Yy]$ ]] || return 0
+        # Ask for size only when we actually need to create a new volume
+        echo "용량: 1)32 2)64 3)128 4)256 (GB)"
+        read -p "선택 [2]: " s
+        s=${s:-2}
+        case "$s" in 1) VOL_SIZE_GB=32 ;; 2) VOL_SIZE_GB=64 ;; 3) VOL_SIZE_GB=128 ;; 4) VOL_SIZE_GB=256 ;; *) VOL_SIZE_GB=64 ;; esac
+        VOLUME_ID=$(aws ec2 create-volume --size "$VOL_SIZE_GB" --availability-zone "$INSTANCE_AZ" --volume-type gp3 --encrypted \
+            --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=$VOL_NAME},{Key=Purpose,Value=temp-terminal-enc}]" \
+            --region "$AWS_REGION" --query 'VolumeId' --output text)
+        aws ec2 wait volume-available --volume-ids "$VOLUME_ID" --region "$AWS_REGION"
+    fi
 	echo "VOLUME_ID=$VOLUME_ID" >>"$STATE_FILE"
 	echo "VOLUME_NAME=$VOL_NAME" >>"$STATE_FILE"
 	aws ec2 attach-volume --volume-id "$VOLUME_ID" --instance-id "$INSTANCE_ID" --device /dev/sdf --region "$AWS_REGION" >/dev/null
@@ -333,7 +335,12 @@ apt-get update && apt-get install -y \
   xfce4 xfce4-goodies xfce4-terminal xterm dbus-x11 software-properties-common \
   tightvncserver novnc websockify \
   xdg-utils exo-utils autocutsel xclip \
-  x11-apps xauth xfonts-base cryptsetup wget gpg
+  x11-apps xauth xfonts-base fontconfig cryptsetup wget gpg
+
+# Install CJK fonts for proper Korean/JP/CN rendering
+echo "[UD] Install CJK fonts"
+apt-get install -y fonts-noto-cjk fonts-noto-cjk-extra fonts-nanum fonts-noto-color-emoji || true
+fc-cache -f -v || true
 
 # Prefer Firefox ESR (deb) over Snap firefox, and install Chrome as fallback
 echo "[UD] Configure browsers"
@@ -394,12 +401,22 @@ echo "[UD] Begin runtime-setup"
 if ! command -v vncserver >/dev/null 2>&1; then
   echo "[UD] Installing vnc + deps"
   until apt-get update; do sleep 2; done
-  apt-get install -y tightvncserver autocutsel xclip xauth xfonts-base dbus-x11 xterm || true
+  apt-get install -y tightvncserver autocutsel xclip xauth xfonts-base fontconfig dbus-x11 xterm || true
 fi
 if ! command -v websockify >/dev/null 2>&1; then
   echo "[UD] Installing novnc/websockify"
   until apt-get update; do sleep 2; done
   apt-get install -y novnc websockify || true
+fi
+echo "[UD] Ensure CJK fonts present"
+if ! command -v fc-list >/dev/null 2>&1; then
+  until apt-get update; do sleep 2; done
+  apt-get install -y fontconfig || true
+fi
+if ! fc-list | grep -qi "Noto.*CJK"; then
+  until apt-get update; do sleep 2; done
+  apt-get install -y fonts-noto-cjk fonts-noto-cjk-extra fonts-nanum fonts-noto-color-emoji || true
+  fc-cache -f -v || true
 fi
 echo "[UD] Configure VNC for ubuntu user"
 VNC_HOME="/home/ubuntu"
