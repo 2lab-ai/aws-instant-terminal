@@ -27,7 +27,7 @@ INSTANCE_NAME="temp-terminal-$(date +%Y%m%d-%H%M%S)"
 TARGET_AZ=""
 USE_ENC_VOL=0
 VOL_NAME=""
-VOL_SIZE_GB=64
+VOL_SIZE_GB=
 CLEANUP_CALLED=0
 
 # Colors
@@ -76,6 +76,8 @@ USE_PRESET="$USE_PRESET"
 CUSTOM_AMI_ID="$CUSTOM_AMI_ID"
 CUSTOM_AMI_NAME="$CUSTOM_AMI_NAME"
 PRESET_FORCE_REBUILD="$PRESET_FORCE_REBUILD"
+USE_ENC_VOL="1"
+VOL_SIZE_GB="${VOL_SIZE_GB}"
 EOF
 	log_info "Saved configuration to $ENV_FILE"
 }
@@ -129,15 +131,31 @@ select_instance_type() {
 	if [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -ge 1 ] && [ "$s" -le ${#candidates[@]} ]; then INSTANCE_TYPE="${candidates[$((s - 1))]}"; else INSTANCE_TYPE="$s"; fi
 }
 
+# Always enable encrypted volume, no prompt
 prompt_encrypted_volume() {
-    read -p "암호화된 EBS 볼륨을 사용하시겠습니까? (y/N): " yn
-    yn=${yn:-N}
-    [[ "$yn" =~ ^[Yy]$ ]] || {
-        USE_ENC_VOL=0
-        return
-    }
-    # Only enable usage here; size will be asked later only if a new volume is created
     USE_ENC_VOL=1
+    update_env_kv USE_ENC_VOL 1
+}
+
+# Ensure encrypted volume size is set; ask once and persist
+ensure_enc_volume_config() {
+    USE_ENC_VOL=1
+    update_env_kv USE_ENC_VOL 1
+    # If VOL_SIZE_GB not set or invalid, ask once and save
+    if ! [[ "${VOL_SIZE_GB:-}" =~ ^[0-9]+$ ]] || [ "${VOL_SIZE_GB:-0}" -le 0 ]; then
+        echo "암호화 데이터 볼륨 용량을 선택하세요: 1)32 2)64 3)128 4)256 (GB)"
+        read -p "선택 [2]: " s
+        s=${s:-2}
+        case "$s" in
+            1) VOL_SIZE_GB=32 ;;
+            2) VOL_SIZE_GB=64 ;;
+            3) VOL_SIZE_GB=128 ;;
+            4) VOL_SIZE_GB=256 ;;
+            *) VOL_SIZE_GB=64 ;;
+        esac
+        update_env_kv VOL_SIZE_GB "$VOL_SIZE_GB"
+        log_info "Encrypted data volume size set: ${VOL_SIZE_GB}GB (saved to .env)"
+    fi
 }
 
 derive_volume_from_key() {
@@ -178,6 +196,7 @@ load_or_init_env() { if [ -f "$ENV_FILE" ]; then
 	CUSTOM_AMI_ID="${CUSTOM_AMI_ID:-}"
 	CUSTOM_AMI_NAME="${CUSTOM_AMI_NAME:-$CUSTOM_AMI_NAME}"
     PRESET_FORCE_REBUILD="${PRESET_FORCE_REBUILD:-0}"
+    VOL_SIZE_GB="${VOL_SIZE_GB:-$VOL_SIZE_GB}"
 	log_info "Loaded configuration from $ENV_FILE"
 else
 	echo "초기 설정을 진행합니다 (.env 생성)."
@@ -282,12 +301,7 @@ attach_and_mount_volume() {
 		VOLUME_AZ=$(aws ec2 describe-volumes --region "$AWS_REGION" --volume-ids "$VOLUME_ID" --query 'Volumes[0].AvailabilityZone' --output text)
 		ATTACHED_TO=$(aws ec2 describe-volumes --region "$AWS_REGION" --volume-ids "$VOLUME_ID" --query 'Volumes[0].Attachments[0].InstanceId' --output text 2>/dev/null || echo None)
 		if [ "$VOLUME_AZ" != "$INSTANCE_AZ" ]; then
-			echo "기존 볼륨이 다른 AZ($VOLUME_AZ)에 있습니다. 새로 생성하시겠습니까? (y/N): "
-			read -r yn
-			[[ "$yn" =~ ^[Yy]$ ]] || {
-				echo "볼륨 작업 생략"
-				return 0
-			}
+			log_warn "Existing encrypted volume in different AZ ($VOLUME_AZ). Creating a new one in $INSTANCE_AZ."
 			VOLUME_ID=""
 		elif [ -n "$ATTACHED_TO" ] && [ "$ATTACHED_TO" != "None" ] && [ "$ATTACHED_TO" != "$INSTANCE_ID" ]; then
 			echo "볼륨이 다른 인스턴스($ATTACHED_TO)에 연결되어 있습니다. 분리 후 연결할까요? (y/N): "
@@ -298,14 +312,12 @@ attach_and_mount_volume() {
 		fi
 	fi
     if [ -z "${VOLUME_ID:-}" ] || [ "$VOLUME_ID" = "None" ]; then
-        read -p "볼륨이 없습니다. 생성할까요? (y/N): " yn
-        yn=${yn:-N}
-        [[ "$yn" =~ ^[Yy]$ ]] || return 0
-        # Ask for size only when we actually need to create a new volume
-        echo "용량: 1)32 2)64 3)128 4)256 (GB)"
-        read -p "선택 [2]: " s
-        s=${s:-2}
-        case "$s" in 1) VOL_SIZE_GB=32 ;; 2) VOL_SIZE_GB=64 ;; 3) VOL_SIZE_GB=128 ;; 4) VOL_SIZE_GB=256 ;; *) VOL_SIZE_GB=64 ;; esac
+        # Ensure VOL_SIZE_GB is available (ask once earlier)
+        if ! [[ "${VOL_SIZE_GB:-}" =~ ^[0-9]+$ ]] || [ "${VOL_SIZE_GB:-0}" -le 0 ]; then
+            VOL_SIZE_GB=64
+            update_env_kv VOL_SIZE_GB "$VOL_SIZE_GB"
+        fi
+        log_info "Creating encrypted EBS volume: size=${VOL_SIZE_GB}GB az=${INSTANCE_AZ}"
         VOLUME_ID=$(aws ec2 create-volume --size "$VOL_SIZE_GB" --availability-zone "$INSTANCE_AZ" --volume-type gp3 --encrypted \
             --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=$VOL_NAME},{Key=Purpose,Value=temp-terminal-enc}]" \
             --region "$AWS_REGION" --query 'VolumeId' --output text)
@@ -676,6 +688,7 @@ main() {
     log_stage "1-Config: Load .env and prompt options"
     load_or_init_env
     prompt_encrypted_volume
+    ensure_enc_volume_config
     echo "REGION=$AWS_REGION" >>"$STATE_FILE"
     VNC_PASSWORD=$(generate_vnc_password)
     echo "VNC_PASSWORD=$VNC_PASSWORD" >>"$STATE_FILE"
